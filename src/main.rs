@@ -2,13 +2,18 @@ mod ec;
 mod fan;
 mod utils;
 
+use io::Seek;
 use std::{
     convert::TryFrom,
     fmt, fs,
     io::{self, Write},
+    iter,
     path::PathBuf,
+    thread,
+    time::Duration,
 };
 use structopt::StructOpt;
+use utils::ResultExt;
 
 type MainResult = utils::FlexibleResult<()>;
 
@@ -54,6 +59,28 @@ enum Command {
         #[structopt(parse(try_from_str = fan::Duty::from_percentage_str))]
         value: fan::Duty,
     },
+
+    /// Automatically manage fan duty
+    ///
+    /// This periodicaly reads the core temperature from the kernels EC interface and updates the
+    /// fan duty based on it. Different policies, implemented as mathematic functions are
+    /// available, to determine the fan duty.
+    ///
+    /// Once the fan control loop is running, this command won't fail. Every error is handled, so
+    /// that the fan never gets unattended: When failing to read the temperature, an infinitely high
+    /// temperature is assumed to stay on the safe side. When the fan duty cannot be set, the cycle
+    /// is skipped and setting it is tried again using the next queried temperature.  All these
+    /// error conditions are reported to stderr. Any errors writing to stderr are ignored.
+    Auto {
+        #[structopt(flatten)]
+        policies: Policies,
+
+        /// Update interval, in milliseconds
+        ///
+        /// Specifies the interval length in which to poll the temperature and update the fan duty.
+        #[structopt(long, short = "i", default_value = "500")]
+        polling_interval: u64,
+    },
 }
 
 #[derive(Debug, StructOpt)]
@@ -85,6 +112,69 @@ struct ShowOptions {
     /// Hide value units
     #[structopt(long, short = "u")]
     hide_units: bool,
+}
+
+#[derive(Debug, StructOpt)]
+struct Policies {
+    /// Determine fan duty as a linear function of the core temperature
+    ///
+    /// The function looks like `duty(temp) = offset + temp * slope'. The slope and offset can be
+    /// controlled via the `--linear-*' options.
+    ///
+    /// This is more intended as a proof-of-concept, as it is not actually a very smart policy.
+    #[structopt(long,
+                required_unless_one(&["exp", "square"]),
+                conflicts_with_all(&["exp", "square"]))]
+    linear: bool,
+    /// Set slope of the fan duty function
+    ///
+    /// Only effective when using the linear policy.
+    #[structopt(long, default_value = "1.0")]
+    linear_slope: f64,
+    /// Set y-axis offset of the fan duty function
+    ///
+    /// Only effective when using the linear policy.
+    #[structopt(long, default_value = "0.0")]
+    linear_offset: f64,
+
+    /// Determine fan duty as an exponential function of the core temperature
+    ///
+    /// The function looks like `duty(temp) = factor * base^temp. The base and factor can be
+    /// controlled via the `--exp-*' options. For the `base^temp` part, the builtin exponential
+    /// functions are used, not actual exponentiation, see `--exp-base' for details.
+    #[structopt(long,
+                required_unless_one(&["linear", "square"]),
+                conflicts_with_all(&["linear", "square"]))]
+    exp: bool,
+    /// Set base of the fan duty function
+    ///
+    /// "e" designates the natural (using `std::f64::exp') and "2" the binary exponential function
+    /// (using `std::f64::exp2').
+    ///
+    /// Only effective when using the exponential policy.
+    #[structopt(long, default_value = "e",
+                possible_values(&["2", "e"]))]
+    exp_base: fan::policy::ExponentialBase,
+    /// Set fan duty factor for exponential function
+    ///
+    /// Only effective when using the exponential policy.
+    #[structopt(long, default_value = "1")]
+    exp_factor: f64,
+
+    /// Determine fan duty as a quadratic function of the core temperature
+    ///
+    /// The function looks like this `duty(temp) = factor * temp^2'. The factor can be controlled
+    /// via the `--factor' option.
+    #[structopt(long,
+                required_unless_one(&["linear", "exp"]),
+                conflicts_with_all(&["linear", "exp"]))]
+    square: bool,
+
+    /// Set fan duty factor for square function
+    ///
+    /// Only effective when using the square policy.
+    #[structopt(long, default_value = "0.01")]
+    square_factor: f64,
 }
 
 impl App {
@@ -166,6 +256,60 @@ impl Command {
                 }
 
                 fan::Control::new()?.set_duty(value)?
+            }
+            Command::Auto {
+                policies,
+                polling_interval,
+            } => {
+                let mut ec = fs::OpenOptions::new()
+                    .read(true)
+                    .open(&general_options.ec_path)?;
+
+                let policy: Box<dyn fan::Policy<Input = utils::Temperature>> = if policies.linear {
+                    Box::new(fan::policy::Linear {
+                        slope: policies.linear_slope,
+                        offset: policies.linear_offset,
+                    })
+                } else if policies.exp {
+                    Box::new(fan::policy::Exponential {
+                        base: policies.exp_base,
+                        factor: policies.exp_factor,
+                    })
+                } else if policies.square {
+                    Box::new(fan::policy::Quadratic {
+                        factor: policies.square_factor,
+                    })
+                } else {
+                    unreachable!("This should be handled by structopt")
+                };
+
+                let mut fan = fan::Control::new()?;
+
+                // Infinite iterator. All errors are handeled, this will /never/ fail.
+                iter::repeat_with(|| {
+                    ec.seek(io::SeekFrom::Start(0))?;
+                    let ec = ec::Registers::try_from(&mut ec as &mut dyn io::Read)?;
+                    Ok(ec.cpu_temp)
+                })
+                .map(|res: Result<_, io::Error>| {
+                    res.unwrap_or_else(|err| {
+                        writeln!(
+                            io::stderr(),
+                            "Error: Cannot read temperature: {}, assuming the worst",
+                            err
+                        )
+                        .ignore();
+                        utils::Temperature::max()
+                    })
+                })
+                .map(|temp| policy.next_fan_duty(temp))
+                .for_each(|duty| {
+                    fan.set_duty(duty).unwrap_or_else(|err| {
+                        writeln!(io::stderr(), "Error: Cannot set fan duty: {}", err).ignore()
+                    });
+
+                    thread::sleep(Duration::from_millis(polling_interval));
+                });
             }
         }
 
