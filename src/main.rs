@@ -13,7 +13,7 @@ use std::{
     time::Duration,
 };
 use structopt::StructOpt;
-use utils::ResultExt;
+use utils::{MovingAverageIteratorExt, MovingMedianIteratorExt, ResultExt};
 
 type MainResult = utils::FlexibleResult<()>;
 
@@ -66,6 +66,10 @@ enum Command {
     /// fan duty based on it. Different policies, implemented as mathematic functions are
     /// available, to determine the fan duty.
     ///
+    /// Some options can be used to try to remove temporary spikes from and generally smoothen the
+    /// temperature curve before calulating the fan duty based on it. This helps reduce fluctuation
+    /// in the fan activity.
+    ///
     /// Once the fan control loop is running, this command won't fail. Every error is handled, so
     /// that the fan never gets unattended: When failing to read the temperature, an infinitely high
     /// temperature is assumed to stay on the safe side. When the fan duty cannot be set, the cycle
@@ -80,6 +84,26 @@ enum Command {
         /// Specifies the interval length in which to poll the temperature and update the fan duty.
         #[structopt(long, short = "i", default_value = "500")]
         polling_interval: u64,
+
+        /// Apply moving average to temperature curve
+        ///
+        /// Usees a moving moving average of the <moving-average> most recent temperature probes as
+        /// basis to the fan duty calculation.
+        ///
+        /// In contrast to the moving median option, the moving average is a bit more sensitive to
+        /// short temperature spikes, but can react faster to sudden, strong temperature changes.
+        #[structopt(long, short = "a")]
+        moving_average: Option<usize>,
+        /// Apply moving median to temperature curve
+        ///
+        /// Uses a moving moving median of the <moving-median> most recent temperature probes as
+        /// basis to the fan duty calculation.
+        ///
+        /// In contrast to the moving average option, the moving median is better at hiding
+        /// temperature spikes, but also more sluggish in reacting to real, longer-lasting
+        /// temperature surges (since they are indistinguishable from short spikes at first).
+        #[structopt(long, short = "m")]
+        moving_median: Option<usize>,
     },
 }
 
@@ -260,6 +284,8 @@ impl Command {
             Command::Auto {
                 policies,
                 polling_interval,
+                moving_average: moving_average_backlog,
+                moving_median: moving_median_backlog,
             } => {
                 let mut ec = fs::OpenOptions::new()
                     .read(true)
@@ -286,7 +312,7 @@ impl Command {
                 let mut fan = fan::Control::new()?;
 
                 // Infinite iterator. All errors are handeled, this will /never/ fail.
-                iter::repeat_with(|| {
+                let temp_curve = iter::repeat_with(|| {
                     ec.seek(io::SeekFrom::Start(0))?;
                     let ec = ec::Registers::try_from(&mut ec as &mut dyn io::Read)?;
                     Ok(ec.cpu_temp)
@@ -301,15 +327,26 @@ impl Command {
                         .ignore();
                         utils::Temperature::max()
                     })
-                })
-                .map(|temp| policy.next_fan_duty(temp))
-                .for_each(|duty| {
-                    fan.set_duty(duty).unwrap_or_else(|err| {
-                        writeln!(io::stderr(), "Error: Cannot set fan duty: {}", err).ignore()
-                    });
-
-                    thread::sleep(Duration::from_millis(polling_interval));
                 });
+
+                let normalized_temp_curve: Box<dyn Iterator<Item = utils::Temperature>> =
+                    if let Some(backlog) = moving_median_backlog {
+                        Box::new(temp_curve.moving_median(backlog))
+                    } else if let Some(backlog) = moving_average_backlog {
+                        Box::new(temp_curve.moving_average(backlog))
+                    } else {
+                        Box::new(temp_curve)
+                    };
+
+                normalized_temp_curve
+                    .map(|temp| policy.next_fan_duty(temp))
+                    .for_each(|duty| {
+                        fan.set_duty(duty).unwrap_or_else(|err| {
+                            writeln!(io::stderr(), "Error: Cannot set fan duty: {}", err).ignore()
+                        });
+
+                        thread::sleep(Duration::from_millis(polling_interval));
+                    });
             }
         }
 
