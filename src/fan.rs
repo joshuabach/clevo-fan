@@ -8,7 +8,7 @@ use crate::{
 use derive_more::Display;
 use std::{error::Error, fmt, num, ops::RangeInclusive, str::FromStr};
 
-#[derive(Debug, PartialEq, PartialOrd)]
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
 pub struct Duty {
     ratio: f64,
 }
@@ -78,6 +78,10 @@ impl Duty {
         f64::from_str(percentage)
             .map_err(ParsePercentageError::ParseFloat)
             .and_then(Duty::from_percentage)
+    }
+
+    pub const fn min() -> Self {
+        Self { ratio: 0.0 }
     }
 }
 

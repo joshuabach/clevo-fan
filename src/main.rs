@@ -67,8 +67,8 @@ enum Command {
     /// available, to determine the fan duty.
     ///
     /// Some options can be used to try to remove temporary spikes from and generally smoothen the
-    /// temperature curve before calulating the fan duty based on it. This helps reduce fluctuation
-    /// in the fan activity.
+    /// temperature before calulating the fan duty based on it. This helps reduce fluctuation in the
+    /// fan activity. Some options also directly affect the fan curve.
     ///
     /// Once the fan control loop is running, this command won't fail. Every error is handled, so
     /// that the fan never gets unattended: When failing to read the temperature, an infinitely
@@ -105,6 +105,23 @@ enum Command {
         /// temperature surges (since they are indistinguishable from short spikes at first).
         #[structopt(long, short = "m")]
         moving_median: Option<usize>,
+
+        /// Only apply fan duty changes smaller than this value
+        ///
+        /// If a calculated new fan duty is within this distance to the current fan change will not
+        /// be applied, unless a requested change is requested for too long. See
+        /// `--max-unchanged-cycles'.
+        #[structopt(long, default_value = "0.0")]
+        min_fan_change: f64,
+        /// Maximum number of consequtive fan duty changes to ignore
+        ///
+        /// When the target fan duty has remained unchanged for the last <max-unchanged-cycles>
+        /// cycles and a change has been continually requested in that period, it is applied even if
+        /// it falls below the <min-fan-change>.
+        ///
+        /// Only effective with `min-fan-change > 0'.
+        #[structopt(long, default_value = "10")]
+        max_unchanged_cycles: usize,
 
         /// Monitor temperature and fan duty curves
         ///
@@ -295,6 +312,8 @@ impl Command {
                 polling_interval,
                 moving_average: moving_average_backlog,
                 moving_median: moving_median_backlog,
+                min_fan_change,
+                max_unchanged_cycles,
                 monitor,
             } => {
                 let mut ec = fs::OpenOptions::new()
@@ -327,6 +346,9 @@ impl Command {
                         write!(io::stdout(), "{:46} ", "Running Average").ignore();
                     } else if moving_median_backlog.is_some() {
                         write!(io::stdout(), "{:46} ", "Running Median").ignore();
+                    }
+                    if min_fan_change > 0.0 {
+                        write!(io::stdout(), "{:56} ", "Fan Duty").ignore();
                     }
                     writeln!(io::stdout(), "{} ", "Fan Duty").ignore();
                 }
@@ -382,20 +404,57 @@ impl Command {
                         normalized_temp_curve
                     };
 
-                normalized_temp_curve
+                let mut current_fan_duty = fan::Duty::min();
+                let mut last_target_fan_duty = fan::Duty::min();
+                let mut unchanged_cycles = 0;
+                let normalized_fan_duty_curve = normalized_temp_curve
                     .map(|temp| policy.next_fan_duty(temp))
-                    .map(|duty| visualize!(duty, duty.as_percentage() as usize, 30, 30))
-                    .for_each(|duty| {
-                        fan.set_duty(duty).unwrap_or_else(|err| {
-                            writeln!(io::stderr(), "Error: Cannot set fan duty: {}", err).ignore()
-                        });
-
-                        if monitor {
-                            writeln!(io::stdout()).ignore()
-                        };
-
-                        thread::sleep(Duration::from_millis(polling_interval));
+                    .map(|duty| visualize!(duty, duty.as_percentage() as usize, 30, 80))
+                    .map(|duty| {
+                        let change_requested =
+                            (duty.as_percentage() - current_fan_duty.as_percentage()).abs() > 1.0;
+                        let changed = (duty.as_percentage() - last_target_fan_duty.as_percentage())
+                            .abs()
+                            <= 1.0;
+                        if change_requested && changed {
+                            unchanged_cycles += 1;
+                        } else {
+                            last_target_fan_duty = duty;
+                            unchanged_cycles = 0;
+                        }
+                        if (duty.as_percentage() - current_fan_duty.as_percentage()).abs()
+                            > min_fan_change
+                            || unchanged_cycles > max_unchanged_cycles
+                        {
+                            current_fan_duty = duty;
+                            duty
+                        } else {
+                            current_fan_duty
+                        }
                     });
+
+                let normalized_fan_duty_curve: Box<dyn Iterator<Item = fan::Duty>> =
+                    if min_fan_change > 0.0 {
+                        Box::new(
+                            normalized_fan_duty_curve.map(|duty| {
+                                visualize!(duty, duty.as_percentage() as usize, 30, 30)
+                            }),
+                        )
+                    } else {
+                        Box::new(normalized_fan_duty_curve)
+                    };
+
+                normalized_fan_duty_curve.for_each(|duty| {
+                    fan.set_duty(duty).unwrap_or_else(|err| {
+                        writeln!(io::stderr(), "Error: Cannot set fan duty: {}", err).ignore()
+                    });
+
+                    if monitor {
+                        writeln!(io::stdout()).ignore()
+                    };
+
+                    thread::sleep(Duration::from_millis(polling_interval));
+                });
             }
         }
 
