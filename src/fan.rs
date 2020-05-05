@@ -62,6 +62,10 @@ impl Duty {
         }
     }
 
+    pub fn as_percentage(&self) -> f64 {
+        self.ratio * 100.
+    }
+
     pub fn from_saturating_percentage(percentage: f64) -> Self {
         Self::from_percentage(percentage).unwrap_or_else(|err| match err {
             ParsePercentageError::TooBig => Self { ratio: 1. },

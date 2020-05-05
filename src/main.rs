@@ -71,10 +71,11 @@ enum Command {
     /// in the fan activity.
     ///
     /// Once the fan control loop is running, this command won't fail. Every error is handled, so
-    /// that the fan never gets unattended: When failing to read the temperature, an infinitely high
-    /// temperature is assumed to stay on the safe side. When the fan duty cannot be set, the cycle
-    /// is skipped and setting it is tried again using the next queried temperature.  All these
-    /// error conditions are reported to stderr. Any errors writing to stderr are ignored.
+    /// that the fan never gets unattended: When failing to read the temperature, an infinitely
+    /// high temperature is assumed to stay on the safe side. When the fan duty cannot be set, the
+    /// cycle is skipped and setting it is tried again using the next queried temperature.  All
+    /// these error conditions are reported to stderr. Any errors writing to stderr (or to stdout)
+    /// are ignored.
     Auto {
         #[structopt(flatten)]
         policies: Policies,
@@ -104,6 +105,14 @@ enum Command {
         /// temperature surges (since they are indistinguishable from short spikes at first).
         #[structopt(long, short = "m")]
         moving_median: Option<usize>,
+
+        /// Monitor temperature and fan duty curves
+        ///
+        /// Prints the current temperature, the preprocessed temperature (if any preprocessing
+        /// option was selected) and the resulting fan duty to stdout in each cycle. The curve of
+        /// each of these values is visualized using ASCII-plotting, using the '#'-character.
+        #[structopt(long)]
+        monitor: bool,
     },
 }
 
@@ -286,6 +295,7 @@ impl Command {
                 polling_interval,
                 moving_average: moving_average_backlog,
                 moving_median: moving_median_backlog,
+                monitor,
             } => {
                 let mut ec = fs::OpenOptions::new()
                     .read(true)
@@ -311,6 +321,30 @@ impl Command {
 
                 let mut fan = fan::Control::new()?;
 
+                if monitor {
+                    write!(io::stdout(), "{:46} ", "CPU Temperature").ignore();
+                    if moving_average_backlog.is_some() {
+                        write!(io::stdout(), "{:46} ", "Running Average").ignore();
+                    } else if moving_median_backlog.is_some() {
+                        write!(io::stdout(), "{:46} ", "Running Median").ignore();
+                    }
+                    writeln!(io::stdout(), "{} ", "Fan Duty").ignore();
+                }
+
+                macro_rules! visualize {
+                    ($value: expr, $raw: expr, $min: expr, $max: expr) => {{
+                        if monitor {
+                            write!(io::stdout(), "{:6} ", $value).ignore();
+                            let mut bar = String::new();
+                            for _ in $min..$raw {
+                                bar.push('#');
+                            }
+                            write!(io::stdout(), "{:width$}", bar, width = $max - $min).ignore();
+                        }
+                        $value
+                    }};
+                }
+
                 // Infinite iterator. All errors are handeled, this will /never/ fail.
                 let temp_curve = iter::repeat_with(|| {
                     ec.seek(io::SeekFrom::Start(0))?;
@@ -327,7 +361,8 @@ impl Command {
                         .ignore();
                         utils::Temperature::max()
                     })
-                });
+                })
+                .map(|temp| visualize!(temp, temp.as_degrees_celsius() as usize, 50, 90));
 
                 let normalized_temp_curve: Box<dyn Iterator<Item = utils::Temperature>> =
                     if let Some(backlog) = moving_median_backlog {
@@ -338,12 +373,26 @@ impl Command {
                         Box::new(temp_curve)
                     };
 
+                let normalized_temp_curve: Box<dyn Iterator<Item = utils::Temperature>> =
+                    if moving_median_backlog.or(moving_average_backlog).is_some() {
+                        Box::new(normalized_temp_curve.map(|temp| {
+                            visualize!(temp, temp.as_degrees_celsius() as usize, 50, 90)
+                        }))
+                    } else {
+                        normalized_temp_curve
+                    };
+
                 normalized_temp_curve
                     .map(|temp| policy.next_fan_duty(temp))
+                    .map(|duty| visualize!(duty, duty.as_percentage() as usize, 30, 30))
                     .for_each(|duty| {
                         fan.set_duty(duty).unwrap_or_else(|err| {
                             writeln!(io::stderr(), "Error: Cannot set fan duty: {}", err).ignore()
                         });
+
+                        if monitor {
+                            writeln!(io::stdout()).ignore()
+                        };
 
                         thread::sleep(Duration::from_millis(polling_interval));
                     });
